@@ -98,6 +98,7 @@ CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 DEFAULT_CODEX_OAUTH_REFRESH_TIMEOUT_SECONDS = 20.0
+CODEX_PROFILE_ALIAS_MIGRATION_LOCK_TIMEOUT_SECONDS = 0.0
 CODEX_OAUTH_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
 CODEX_REFRESH_OWNER = "hermes-auth-store-v1"
 CODEX_SUPERSEDED_REFRESH_TOKEN_HASHES_KEY = "superseded_refresh_token_hashes"
@@ -1016,7 +1017,7 @@ def _file_lock(
         lock_path.write_text(" ", encoding="utf-8")
 
     with lock_path.open("r+" if msvcrt else "a+", encoding="utf-8") as lock_file:
-        deadline = time.monotonic() + max(1.0, timeout_seconds)
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
         while True:
             try:
                 if fcntl:
@@ -3941,7 +3942,9 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     Raises AuthError if no Codex tokens are stored.
     """
     if _lock:
-        with _codex_auth_store_lock():
+        with _codex_auth_store_lock(
+            timeout_seconds=_codex_auth_lock_timeout_seconds(),
+        ):
             auth_store = _load_auth_store(_codex_auth_file_path())
     else:
         auth_store = _load_auth_store(_codex_auth_file_path())
@@ -4163,7 +4166,11 @@ def _sync_codex_profile_legacy_aliases(
     last_refresh: str,
     linked_legacy_tokens: Any,
 ) -> None:
-    """Best-effort migration for linked aliases in named profiles."""
+    """Best-effort migration for linked aliases in named profiles.
+
+    Skip busy profiles immediately: this can run while the canonical refresh
+    lock is held, and alias migration must not delay durable token rotation.
+    """
     profiles_dir = _codex_auth_file_path().parent / "profiles"
     if not profiles_dir.is_dir():
         return
@@ -4175,7 +4182,7 @@ def _sync_codex_profile_legacy_aliases(
             with _file_lock(
                 profile_auth_file.with_suffix(".lock"),
                 threading.local(),
-                AUTH_LOCK_TIMEOUT_SECONDS,
+                CODEX_PROFILE_ALIAS_MIGRATION_LOCK_TIMEOUT_SECONDS,
                 f"Timed out waiting for Codex profile auth lock: {profile_auth_file}",
             ):
                 auth_store = _load_auth_store(profile_auth_file)
@@ -4379,10 +4386,9 @@ def refresh_codex_oauth_pure(
             relogin_required = True
         if code == "refresh_token_reused":
             message = (
-                "Codex refresh token was already consumed by another client "
-                "(e.g. Codex CLI or VS Code extension). "
-                "Run `codex` in your terminal to generate fresh tokens, "
-                "then run `hermes auth` to re-authenticate."
+                "Codex refresh token was already consumed. "
+                "Run `hermes model`, choose OpenAI Codex, and complete a fresh "
+                "Hermes login."
             )
             relogin_required = True
         # A 401/403 from the token endpoint always means the refresh token
@@ -4433,6 +4439,17 @@ def _codex_refresh_timeout_seconds() -> float:
             "HERMES_CODEX_REFRESH_TIMEOUT_SECONDS",
             str(DEFAULT_CODEX_OAUTH_REFRESH_TIMEOUT_SECONDS),
         )
+    )
+
+
+def _codex_auth_lock_timeout_seconds(
+    refresh_timeout_seconds: Optional[float] = None,
+) -> float:
+    if refresh_timeout_seconds is None:
+        refresh_timeout_seconds = _codex_refresh_timeout_seconds()
+    return max(
+        float(AUTH_LOCK_TIMEOUT_SECONDS),
+        refresh_timeout_seconds + 5.0,
     )
 
 
@@ -4502,7 +4519,9 @@ def resolve_codex_runtime_credentials(
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
         # Re-read under lock to avoid racing with other Hermes processes
-        with _codex_auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+        with _codex_auth_store_lock(
+            timeout_seconds=_codex_auth_lock_timeout_seconds(refresh_timeout_seconds),
+        ):
             data = _read_codex_tokens(_lock=False)
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
