@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -112,6 +112,7 @@ SHARED_CREDENTIAL_POOL_STATUS_FIELDS = frozenset({
     "last_error_message",
     "last_error_reset_at",
 })
+CREDENTIAL_POOL_ORDER_FIELDS = frozenset({"priority"})
 XAI_OAUTH_ISSUER = "https://auth.x.ai"
 XAI_OAUTH_DISCOVERY_URL = f"{XAI_OAUTH_ISSUER}/.well-known/openid-configuration"
 XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -1285,25 +1286,128 @@ def _merge_shared_credential_pool_status(
     provider_id: str,
     current_entries: List[Dict[str, Any]],
     snapshot_entries: List[Dict[str, Any]],
+    auth_store: Dict[str, Any],
+    *,
+    update_order_entry_ids: Set[str],
+    update_status_entry_ids: Set[str],
 ) -> List[Dict[str, Any]]:
-    """Apply status-only snapshot updates without replaying stale OAuth tokens."""
-    snapshots_by_id = {
-        entry.get("id"): entry
-        for entry in snapshot_entries
-        if _is_shared_credential_pool_entry(provider_id, entry)
-        and isinstance(entry.get("id"), str)
-    }
+    """Merge shared snapshots without replaying stale OAuth tokens."""
+    providers = auth_store.get("providers")
+    state = providers.get(provider_id) if isinstance(providers, dict) else None
+    tokens = state.get("tokens") if isinstance(state, dict) else None
+
+    def _matches_canonical(entry: Dict[str, Any]) -> bool:
+        if not isinstance(tokens, dict):
+            return False
+        access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
+        return (
+            isinstance(access_token, str)
+            and bool(access_token)
+            and isinstance(refresh_token, str)
+            and bool(refresh_token)
+            and entry.get("access_token") == access_token
+            and entry.get("refresh_token") == refresh_token
+        )
+
+    snapshots_by_source = {}
+    for snapshot in snapshot_entries:
+        if not _is_shared_credential_pool_entry(provider_id, snapshot):
+            continue
+        source = snapshot.get("source")
+        existing = snapshots_by_source.get(source)
+        if existing is None or (
+            _matches_canonical(snapshot) and not _matches_canonical(existing)
+        ):
+            snapshots_by_source[source] = snapshot
+
     merged = []
+    merged_sources = set()
     for current in current_entries:
+        source = current.get("source")
+        if source in merged_sources:
+            continue
+        merged_sources.add(source)
         updated = dict(current)
-        snapshot = snapshots_by_id.get(current.get("id"))
+        snapshot = snapshots_by_source.get(source)
         current_refresh = current.get("refresh_token")
         if (
             isinstance(snapshot, dict)
-            and isinstance(current_refresh, str)
-            and current_refresh
+            and _matches_canonical(snapshot)
+            and not _matches_canonical(current)
+        ):
+            updated = dict(snapshot)
+        elif isinstance(snapshot, dict):
+            if (
+                current.get("id") in update_order_entry_ids
+                or snapshot.get("id") in update_order_entry_ids
+            ):
+                for field in CREDENTIAL_POOL_ORDER_FIELDS:
+                    if field in snapshot:
+                        updated[field] = snapshot[field]
+            if (
+                (
+                    current.get("id") in update_status_entry_ids
+                    or snapshot.get("id") in update_status_entry_ids
+                )
+                and isinstance(current_refresh, str)
+                and current_refresh
+                and snapshot.get("access_token") == current.get("access_token")
+                and snapshot.get("refresh_token") == current_refresh
+            ):
+                for field in SHARED_CREDENTIAL_POOL_STATUS_FIELDS:
+                    if field in snapshot:
+                        updated[field] = snapshot[field]
+                    else:
+                        updated.pop(field, None)
+        merged.append(updated)
+    merged.extend(
+        dict(snapshot)
+        for source, snapshot in snapshots_by_source.items()
+        if source not in merged_sources and _matches_canonical(snapshot)
+    )
+    return merged
+
+
+def _merge_credential_pool_snapshot_entries(
+    current_entries: List[Dict[str, Any]],
+    snapshot_entries: List[Dict[str, Any]],
+    *,
+    add_entry_ids: Set[str],
+    replace_entry_ids: Set[str],
+    remove_entry_ids: Set[str],
+    update_order_entry_ids: Set[str],
+    update_status_entry_ids: Set[str],
+) -> List[Dict[str, Any]]:
+    """Merge independent rows while preserving newer persisted credentials."""
+    snapshots_by_id = {
+        entry.get("id"): entry
+        for entry in snapshot_entries
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    }
+    merged = []
+    current_ids = set()
+    for current in current_entries:
+        entry_id = current.get("id")
+        current_ids.add(entry_id)
+        if entry_id in remove_entry_ids:
+            continue
+        snapshot = snapshots_by_id.get(entry_id)
+        if snapshot is None:
+            merged.append(dict(current))
+            continue
+        if entry_id in replace_entry_ids:
+            merged.append(dict(snapshot))
+            continue
+        updated = dict(current)
+        if entry_id in update_order_entry_ids:
+            for field in CREDENTIAL_POOL_ORDER_FIELDS:
+                if field in snapshot:
+                    updated[field] = snapshot[field]
+        if (
+            entry_id in update_status_entry_ids
             and snapshot.get("access_token") == current.get("access_token")
-            and snapshot.get("refresh_token") == current_refresh
+            and snapshot.get("refresh_token") == current.get("refresh_token")
         ):
             for field in SHARED_CREDENTIAL_POOL_STATUS_FIELDS:
                 if field in snapshot:
@@ -1311,6 +1415,13 @@ def _merge_shared_credential_pool_status(
                 else:
                     updated.pop(field, None)
         merged.append(updated)
+    merged.extend(
+        dict(snapshot)
+        for snapshot in snapshot_entries
+        if snapshot.get("id") not in current_ids
+        and snapshot.get("id") in add_entry_ids
+        and snapshot.get("id") not in remove_entry_ids
+    )
     return merged
 
 
@@ -1386,6 +1497,13 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     preserve_shared_entries: bool = False,
+    preserve_profile_entries: bool = False,
+    add_entry_ids: FrozenSet[str] = frozenset(),
+    replace_entry_ids: FrozenSet[str] = frozenset(),
+    remove_entry_ids: FrozenSet[str] = frozenset(),
+    update_order_entry_ids: FrozenSet[str] = frozenset(),
+    update_status_entry_ids: FrozenSet[str] = frozenset(),
+    clear_shared_provider_state: bool = False,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1398,9 +1516,10 @@ def write_credential_pool(
         if isinstance(entry, dict) else entry
         for entry in entries
     ]
-    if provider_id in SHARED_CREDENTIAL_POOL_PROVIDERS and _global_auth_file_path() is not None:
+    if provider_id in SHARED_CREDENTIAL_POOL_PROVIDERS:
         shared_auth_file = _codex_auth_file_path()
         profile_auth_file = _auth_file_path()
+        split_shared_store = shared_auth_file != profile_auth_file
         shared_entries = [
             entry for entry in sanitized_entries
             if _is_shared_credential_pool_entry(provider_id, entry)
@@ -1437,35 +1556,65 @@ def write_credential_pool(
                     provider_id,
                     current_shared_entries,
                     shared_entries,
+                    shared_auth_store,
+                    update_order_entry_ids=set(update_order_entry_ids),
+                    update_status_entry_ids=set(update_status_entry_ids),
                 )
-            shared_pool[provider_id] = root_profile_entries + shared_entries
+            if not split_shared_store and preserve_profile_entries:
+                profile_entries = _merge_credential_pool_snapshot_entries(
+                    root_profile_entries,
+                    profile_entries,
+                    add_entry_ids=set(add_entry_ids),
+                    replace_entry_ids=set(replace_entry_ids),
+                    remove_entry_ids=set(remove_entry_ids),
+                    update_order_entry_ids=set(update_order_entry_ids),
+                    update_status_entry_ids=set(update_status_entry_ids),
+                )
+            shared_pool[provider_id] = (
+                root_profile_entries + shared_entries
+                if split_shared_store
+                else profile_entries + shared_entries
+            )
+            if clear_shared_provider_state:
+                providers = shared_auth_store.get("providers")
+                if isinstance(providers, dict):
+                    providers.pop(provider_id, None)
             _save_auth_store(shared_auth_store, auth_file=shared_auth_file)
 
-            if profile_entries or profile_auth_file.exists():
+            if split_shared_store and (profile_entries or profile_auth_file.exists()):
                 with _auth_store_lock():
                     profile_auth_store = _load_auth_store(profile_auth_file)
                     profile_pool = profile_auth_store.get("credential_pool")
                     if not isinstance(profile_pool, dict):
                         profile_pool = {}
                         profile_auth_store["credential_pool"] = profile_pool
+                    if preserve_profile_entries:
+                        existing_profile_entries = profile_pool.get(provider_id)
+                        profile_entries = _merge_credential_pool_snapshot_entries(
+                            (
+                                existing_profile_entries
+                                if isinstance(existing_profile_entries, list)
+                                else []
+                            ),
+                            profile_entries,
+                            add_entry_ids=set(add_entry_ids),
+                            replace_entry_ids=set(replace_entry_ids),
+                            remove_entry_ids=set(remove_entry_ids),
+                            update_order_entry_ids=set(update_order_entry_ids),
+                            update_status_entry_ids=set(update_status_entry_ids),
+                        )
                     profile_pool[provider_id] = profile_entries
                     return _save_auth_store(profile_auth_store, auth_file=profile_auth_file)
         return shared_auth_file
 
-    shared_auth_file = (
-        _codex_auth_file_path()
-        if provider_id in SHARED_CREDENTIAL_POOL_PROVIDERS
-        else None
-    )
-    lock = _codex_auth_store_lock if shared_auth_file is not None else _auth_store_lock
-    with lock():
-        auth_store = _load_auth_store(shared_auth_file)
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
             auth_store["credential_pool"] = pool
         pool[provider_id] = sanitized_entries
-        return _save_auth_store(auth_store, auth_file=shared_auth_file)
+        return _save_auth_store(auth_store)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
@@ -3597,7 +3746,7 @@ def _sync_codex_pool_entries(
     tokens: Dict[str, str],
     last_refresh: Optional[str],
     *,
-    refreshable_sources: FrozenSet[str] = frozenset({"device_code", "manual:device_code"}),
+    refreshable_sources: FrozenSet[str] = frozenset({"device_code"}),
 ) -> bool:
     """Mirror a fresh Codex re-auth into the credential_pool OAuth entries.
 
@@ -3612,23 +3761,11 @@ def _sync_codex_pool_entries(
     * ``device_code`` — the singleton-seeded entry written by the device-code
       OAuth flow when the user logged in via ``hermes setup`` / the model
       picker.  Always synced with the fresh tokens.
-    * ``manual:device_code`` — entries created by ``hermes auth add openai-codex``
-      that use the same device-code OAuth mechanism.  An interactive re-auth
-      proves the user owns the ChatGPT account, so it is safe (and expected)
-      to refresh these entries too.  Without this, a user who once ran the
-      ``hermes auth add`` workaround for #33000 would silently leave that
-      manual entry stale on every subsequent re-auth, recreating the issue
-      reported in #33538.
-
     What does NOT get refreshed:
 
-    * ``manual:api_key`` and any other non-device-code manual sources — those
-      are independent credentials (an explicit API key, a different ChatGPT
-      account, etc.) and must not be overwritten by a single re-auth.
-
-    Callers scope ``refreshable_sources`` to the store they are mutating. In
-    named-profile mode, the root store contains the shared ``device_code``
-    family while ``manual:device_code`` rows stay local to the active profile.
+    * ``manual:*`` entries — those are independent credentials (an explicit
+      API key, a different ChatGPT account, etc.) and must not be overwritten
+      by a canonical re-auth.
 
     Error markers (``last_status``, ``last_error_*``) are also cleared on
     every refreshed entry so that an interactive re-auth gives each relevant
@@ -3680,33 +3817,8 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None) -> None
         state["auth_mode"] = "chatgpt"
         state["refresh_owner"] = CODEX_REFRESH_OWNER
         _store_provider_state(auth_store, "openai-codex", state, set_active=False)
-        local_auth_file = _auth_file_path()
-        if auth_file == local_auth_file:
-            _sync_codex_pool_entries(auth_store, tokens, last_refresh)
-            _save_auth_store(auth_store, auth_file=auth_file)
-        else:
-            _sync_codex_pool_entries(
-                auth_store,
-                tokens,
-                last_refresh,
-                refreshable_sources=frozenset({"device_code"}),
-            )
-            _save_auth_store(auth_store, auth_file=auth_file)
-            # The root store is authoritative for the shared refresh-token
-            # family. A profile-local mirror failure must not prevent the
-            # already-rotated canonical token from reaching disk.
-            try:
-                with _auth_store_lock():
-                    local_auth_store = _load_auth_store(local_auth_file)
-                    if _sync_codex_pool_entries(
-                        local_auth_store,
-                        tokens,
-                        last_refresh,
-                        refreshable_sources=frozenset({"manual:device_code"}),
-                    ):
-                        _save_auth_store(local_auth_store, auth_file=local_auth_file)
-            except Exception as exc:
-                logger.warning("Failed to sync Codex tokens to profile auth store: %s", exc)
+        _sync_codex_pool_entries(auth_store, tokens, last_refresh)
+        _save_auth_store(auth_store, auth_file=auth_file)
 
 
 def refresh_codex_oauth_pure(

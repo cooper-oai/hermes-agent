@@ -477,11 +477,28 @@ class CredentialPool:
                 self._entries[idx] = new
                 return
 
-    def _persist(self, *, replace_shared_entries: bool = False) -> None:
+    def _persist(
+        self,
+        *,
+        replace_shared_entries: bool = False,
+        add_entry_ids: Optional[Set[str]] = None,
+        replace_entry_ids: Optional[Set[str]] = None,
+        remove_entry_ids: Optional[Set[str]] = None,
+        update_order_entry_ids: Optional[Set[str]] = None,
+        update_status_entry_ids: Optional[Set[str]] = None,
+        clear_shared_provider_state: bool = False,
+    ) -> None:
         write_credential_pool(
             self.provider,
             [entry.to_dict() for entry in self._entries],
             preserve_shared_entries=not replace_shared_entries,
+            preserve_profile_entries=True,
+            add_entry_ids=frozenset(add_entry_ids or ()),
+            replace_entry_ids=frozenset(replace_entry_ids or ()),
+            remove_entry_ids=frozenset(remove_entry_ids or ()),
+            update_order_entry_ids=frozenset(update_order_entry_ids or ()),
+            update_status_entry_ids=frozenset(update_status_entry_ids or ()),
+            clear_shared_provider_state=clear_shared_provider_state,
         )
 
     def _is_terminal_auth_failure(
@@ -535,7 +552,7 @@ class CredentialPool:
             last_error_reset_at=normalized_error.get("reset_at"),
         )
         self._replace_entry(entry, updated)
-        self._persist()
+        self._persist(update_status_entry_ids={updated.id})
         return updated
 
     def _sync_anthropic_entry_from_credentials_file(self, entry: PooledCredential) -> PooledCredential:
@@ -617,7 +634,7 @@ class CredentialPool:
                             entry.id,
                         )
                         self._replace_entry(entry, persisted)
-                        return persisted
+                        entry = persisted
                     break
 
                 if entry.source != "device_code":
@@ -1146,6 +1163,21 @@ class CredentialPool:
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
+                    if entry.source != "device_code":
+                        updated = replace(
+                            entry,
+                            last_status=STATUS_DEAD,
+                            last_status_at=time.time(),
+                            last_error_code=401,
+                            last_error_reason=getattr(exc, "code", "unknown"),
+                            last_error_message=str(exc),
+                            last_error_reset_at=None,
+                        )
+                        self._replace_entry(entry, updated)
+                        if self._current_id == entry.id:
+                            self._current_id = None
+                        self._persist(update_status_entry_ids={updated.id})
+                        return None
                     try:
                         with auth_mod._codex_auth_store_lock():
                             auth_file = auth_mod._codex_auth_file_path()
@@ -1264,13 +1296,21 @@ class CredentialPool:
         )
         self._replace_entry(entry, updated)
         if self.provider == "openai-codex" and updated.source == "device_code":
-            persisted = auth_mod._read_codex_tokens(_lock=False)
-            tokens = dict(persisted["tokens"])
+            auth_store = _load_auth_store(auth_mod._codex_auth_file_path())
+            state = _load_provider_state(auth_store, "openai-codex") or {}
+            persisted_tokens = state.get("tokens")
+            tokens = dict(persisted_tokens) if isinstance(persisted_tokens, dict) else {}
             tokens["access_token"] = updated.access_token
             if updated.refresh_token:
                 tokens["refresh_token"] = updated.refresh_token
             auth_mod._save_codex_tokens(tokens, updated.last_refresh)
-        self._persist()
+        self._persist(
+            replace_entry_ids=(
+                {updated.id}
+                if self.provider == "openai-codex" and updated.source != "device_code"
+                else None
+            ),
+        )
         # Sync refreshed tokens back to auth.json providers so that
         # _seed_from_singletons() on the next load_pool() sees fresh state
         # instead of re-seeding stale/consumed tokens.
@@ -1316,6 +1356,7 @@ class CredentialPool:
         now = time.time()
         cleared_any = False
         entries_to_prune: List[str] = []
+        status_entry_ids: Set[str] = set()
         available: List[PooledCredential] = []
         for entry in self._entries:
             # For anthropic claude_code entries, sync from the credentials file
@@ -1406,6 +1447,7 @@ class CredentialPool:
                     self._replace_entry(entry, cleared)
                     entry = cleared
                     cleared_any = True
+                    status_entry_ids.add(entry.id)
             if refresh and self._entry_needs_refresh(entry):
                 refreshed = self._refresh_entry(entry, force=False)
                 if refreshed is None:
@@ -1416,7 +1458,10 @@ class CredentialPool:
             pruned_ids = set(entries_to_prune)
             self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
-            self._persist()
+            self._persist(
+                remove_entry_ids=set(entries_to_prune),
+                update_status_entry_ids=status_entry_ids,
+            )
         return available
 
     def _select_unlocked(self) -> Optional[PooledCredential]:
@@ -1444,7 +1489,7 @@ class CredentialPool:
             rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
             rotated.append(replace(entry, priority=len(self._entries) - 1))
             self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
-            self._persist()
+            self._persist(update_order_entry_ids={candidate.id for candidate in self._entries})
             self._current_id = entry.id
             return self.current() or entry
 
@@ -1561,6 +1606,7 @@ class CredentialPool:
     def reset_statuses(self) -> int:
         count = 0
         new_entries = []
+        reset_entry_ids = set()
         for entry in self._entries:
             if entry.last_status or entry.last_status_at or entry.last_error_code:
                 new_entries.append(
@@ -1575,11 +1621,12 @@ class CredentialPool:
                     )
                 )
                 count += 1
+                reset_entry_ids.add(entry.id)
             else:
                 new_entries.append(entry)
         if count:
             self._entries = new_entries
-            self._persist()
+            self._persist(update_status_entry_ids=reset_entry_ids)
         return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
@@ -1592,6 +1639,11 @@ class CredentialPool:
         ]
         self._persist(
             replace_shared_entries=(
+                self.provider == "openai-codex" and removed.source == "device_code"
+            ),
+            remove_entry_ids={removed.id},
+            update_order_entry_ids={entry.id for entry in self._entries},
+            clear_shared_provider_state=(
                 self.provider == "openai-codex" and removed.source == "device_code"
             ),
         )
@@ -1627,7 +1679,7 @@ class CredentialPool:
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
         entry = replace(entry, priority=_next_priority(self._entries))
         self._entries.append(entry)
-        self._persist()
+        self._persist(add_entry_ids={entry.id})
         return entry
 
 
@@ -2264,5 +2316,6 @@ def load_pool(provider: str) -> CredentialPool:
             provider,
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
             preserve_shared_entries=True,
+            preserve_profile_entries=True,
         )
     return CredentialPool(provider, entries)
