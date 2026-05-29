@@ -154,6 +154,100 @@ def test_codex_pool_shares_only_global_device_code_entry(profile_env):
     ]
 
 
+def test_codex_profile_legacy_local_suppression_hides_shared_entry(profile_env):
+    """A pre-shared-store profile suppression still hides the canonical row."""
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import is_source_suppressed, unsuppress_credential_source
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(
+        pool={
+            "openai-codex": [{
+                "id": "glob-codex",
+                "source": "device_code",
+                "auth_type": "oauth",
+                "access_token": "global-at",
+                "refresh_token": "global-rt",
+            }],
+        },
+        providers={
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "global-at",
+                    "refresh_token": "global-rt",
+                },
+            },
+        },
+    ))
+    _write(profile_env["profile"] / "auth.json", {
+        "version": 1,
+        "providers": {},
+        "suppressed_sources": {"openai-codex": ["device_code"]},
+    })
+
+    assert is_source_suppressed("openai-codex", "device_code") is True
+    assert load_pool("openai-codex").entries() == []
+
+    assert unsuppress_credential_source("openai-codex", "device_code") is True
+    assert is_source_suppressed("openai-codex", "device_code") is False
+    assert [entry.source for entry in load_pool("openai-codex").entries()] == [
+        "device_code",
+    ]
+    profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert "suppressed_sources" not in profile_data
+
+
+def test_codex_profile_read_normalizes_identityless_rows_before_remove(profile_env):
+    """Legacy rows receive durable IDs before a merged profile mutates them."""
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import CODEX_REFRESH_OWNER
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(
+        pool={
+            "openai-codex": [{
+                "source": "device_code",
+                "auth_type": "oauth",
+                "access_token": "global-at",
+                "refresh_token": "global-rt",
+            }],
+        },
+        providers={
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "global-at",
+                    "refresh_token": "global-rt",
+                },
+                "refresh_owner": CODEX_REFRESH_OWNER,
+            },
+        },
+    ))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "access_token": "manual-at",
+            "refresh_token": "manual-rt",
+        }],
+    }))
+
+    pool = load_pool("openai-codex")
+    persisted_global = json.loads((profile_env["global"] / "auth.json").read_text())
+    persisted_profile = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert persisted_global["credential_pool"]["openai-codex"][0]["id"]
+    assert persisted_profile["credential_pool"]["openai-codex"][0]["id"]
+    manual_index = next(
+        index
+        for index, entry in enumerate(pool.entries(), start=1)
+        if entry.source == "manual:device_code"
+    )
+
+    assert pool.remove_index(manual_index) is not None
+    assert [entry.source for entry in load_pool("openai-codex").entries()] == [
+        "device_code",
+    ]
+    persisted_profile = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert persisted_profile["credential_pool"]["openai-codex"] == []
+
+
 def test_per_provider_shadowing_is_independent(profile_env):
     """Profile can override one provider while inheriting another from global."""
     from hermes_cli.auth import read_credential_pool
@@ -1262,3 +1356,86 @@ def test_clear_codex_auth_removes_linked_aliases_from_sibling_profiles(profile_e
     assert [
         entry["id"] for entry in sibling_data["credential_pool"]["openai-codex"]
     ] == ["sibling-independent"]
+
+
+def test_clear_codex_auth_continues_after_sibling_alias_cleanup_failure(
+    profile_env, monkeypatch,
+):
+    """One busy sibling profile must not block canonical Codex logout."""
+    from contextlib import contextmanager
+    import hermes_cli.auth as auth_mod
+
+    blocked = profile_env["global"] / "profiles" / "blocked"
+    healthy = profile_env["global"] / "profiles" / "healthy"
+    blocked.mkdir()
+    healthy.mkdir()
+    _write(profile_env["global"] / "auth.json", {
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "shared-at",
+                    "refresh_token": "shared-rt",
+                },
+            },
+        },
+        "credential_pool": {
+            "openai-codex": [{
+                "id": "root-linked",
+                "source": "manual:device_code",
+                "auth_type": "oauth",
+                "access_token": "root-linked-at",
+                "refresh_token": "shared-rt",
+            }, {
+                "id": "shared-codex",
+                "source": "device_code",
+                "auth_type": "oauth",
+                "access_token": "shared-at",
+                "refresh_token": "shared-rt",
+            }],
+        },
+    })
+    for profile in (blocked, healthy):
+        _write(profile / "auth.json", {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [{
+                    "id": f"{profile.name}-linked",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "access_token": f"{profile.name}-linked-at",
+                    "refresh_token": "shared-rt",
+                }, {
+                    "id": f"{profile.name}-independent",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "access_token": f"{profile.name}-independent-at",
+                    "refresh_token": f"{profile.name}-independent-rt",
+                }],
+            },
+        })
+
+    original_file_lock = auth_mod._file_lock
+
+    @contextmanager
+    def _file_lock(lock_path, *args, **kwargs):
+        if lock_path == (blocked / "auth.lock"):
+            raise TimeoutError("blocked sibling")
+        with original_file_lock(lock_path, *args, **kwargs):
+            yield
+
+    monkeypatch.setattr(auth_mod, "_file_lock", _file_lock)
+
+    assert auth_mod.clear_provider_auth("openai-codex") is True
+
+    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert "openai-codex" not in global_data["providers"]
+    assert global_data["credential_pool"]["openai-codex"] == []
+    blocked_data = json.loads((blocked / "auth.json").read_text())
+    assert [
+        entry["id"] for entry in blocked_data["credential_pool"]["openai-codex"]
+    ] == ["blocked-linked", "blocked-independent"]
+    healthy_data = json.loads((healthy / "auth.json").read_text())
+    assert [
+        entry["id"] for entry in healthy_data["credential_pool"]["openai-codex"]
+    ] == ["healthy-independent"]
