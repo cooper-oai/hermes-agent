@@ -445,11 +445,23 @@ def get_pool_strategy(provider: str) -> str:
 DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
 
 
+def _credential_identity(entry: PooledCredential) -> Tuple[str, str]:
+    return entry.id, entry.source
+
+
+def _payload_identity(payload: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    entry_id = payload.get("id")
+    source = payload.get("source")
+    if not isinstance(entry_id, str) or not isinstance(source, str):
+        return None
+    return entry_id, source
+
+
 class CredentialPool:
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
-        self._current_id: Optional[str] = None
+        self._current_identity: Optional[Tuple[str, str]] = None
         self._strategy = get_pool_strategy(provider)
         self._lock = threading.Lock()
         self._active_leases: Dict[str, int] = {}
@@ -466,26 +478,40 @@ class CredentialPool:
         return list(self._entries)
 
     def current(self) -> Optional[PooledCredential]:
-        if not self._current_id:
+        if not self._current_identity:
             return None
-        return next((entry for entry in self._entries if entry.id == self._current_id), None)
+        return next(
+            (
+                entry for entry in self._entries
+                if _credential_identity(entry) == self._current_identity
+            ),
+            None,
+        )
 
     def _replace_entry(self, old: PooledCredential, new: PooledCredential) -> None:
-        """Swap an entry in-place by id, preserving sort order."""
+        """Swap an entry in-place without confusing colliding profile IDs."""
         for idx, entry in enumerate(self._entries):
-            if entry.id == old.id:
+            if entry is old:
                 self._entries[idx] = new
+                if self._current_identity == _credential_identity(old):
+                    self._current_identity = _credential_identity(new)
+                return
+        for idx, entry in enumerate(self._entries):
+            if _credential_identity(entry) == _credential_identity(old):
+                self._entries[idx] = new
+                if self._current_identity == _credential_identity(old):
+                    self._current_identity = _credential_identity(new)
                 return
 
     def _persist(
         self,
         *,
         replace_shared_entries: bool = False,
-        add_entry_ids: Optional[Set[str]] = None,
-        replace_entry_ids: Optional[Set[str]] = None,
-        remove_entry_ids: Optional[Set[str]] = None,
-        update_order_entry_ids: Optional[Set[str]] = None,
-        update_status_entry_ids: Optional[Set[str]] = None,
+        add_entry_identities: Optional[Set[Tuple[str, str]]] = None,
+        replace_entry_identities: Optional[Set[Tuple[str, str]]] = None,
+        remove_entry_identities: Optional[Set[Tuple[str, str]]] = None,
+        update_order_entry_identities: Optional[Set[Tuple[str, str]]] = None,
+        update_status_entry_identities: Optional[Set[Tuple[str, str]]] = None,
         clear_shared_provider_state: bool = False,
     ) -> None:
         write_credential_pool(
@@ -493,11 +519,11 @@ class CredentialPool:
             [entry.to_dict() for entry in self._entries],
             preserve_shared_entries=not replace_shared_entries,
             preserve_profile_entries=True,
-            add_entry_ids=frozenset(add_entry_ids or ()),
-            replace_entry_ids=frozenset(replace_entry_ids or ()),
-            remove_entry_ids=frozenset(remove_entry_ids or ()),
-            update_order_entry_ids=frozenset(update_order_entry_ids or ()),
-            update_status_entry_ids=frozenset(update_status_entry_ids or ()),
+            add_entry_identities=frozenset(add_entry_identities or ()),
+            replace_entry_identities=frozenset(replace_entry_identities or ()),
+            remove_entry_identities=frozenset(remove_entry_identities or ()),
+            update_order_entry_identities=frozenset(update_order_entry_identities or ()),
+            update_status_entry_identities=frozenset(update_status_entry_identities or ()),
             clear_shared_provider_state=clear_shared_provider_state,
         )
 
@@ -552,7 +578,7 @@ class CredentialPool:
             last_error_reset_at=normalized_error.get("reset_at"),
         )
         self._replace_entry(entry, updated)
-        self._persist(update_status_entry_ids={updated.id})
+        self._persist(update_status_entry_identities={_credential_identity(updated)})
         return updated
 
     def _sync_anthropic_entry_from_credentials_file(self, entry: PooledCredential) -> PooledCredential:
@@ -614,8 +640,22 @@ class CredentialPool:
             return entry
         try:
             with auth_mod._codex_auth_store_lock():
-                for payload in read_credential_pool("openai-codex"):
-                    if not isinstance(payload, dict) or payload.get("id") != entry.id:
+                if entry.source == "device_code":
+                    persisted_entries = read_credential_pool("openai-codex")
+                else:
+                    auth_store = _load_auth_store()
+                    pool = auth_store.get("credential_pool")
+                    persisted_entries = (
+                        pool.get("openai-codex", [])
+                        if isinstance(pool, dict)
+                        else []
+                    )
+                for payload in persisted_entries:
+                    if (
+                        not isinstance(payload, dict)
+                        or payload.get("id") != entry.id
+                        or payload.get("source") != entry.source
+                    ):
                         continue
                     persisted = PooledCredential.from_dict("openai-codex", payload)
                     if (
@@ -1139,8 +1179,8 @@ class CredentialPool:
                         item for item in self._entries
                         if item.source != "loopback_pkce"
                     ]
-                    if self._current_id == entry.id:
-                        self._current_id = None
+                    if self._current_identity == _credential_identity(entry):
+                        self._current_identity = None
                     self._persist()
                     return None
             # For openai-codex: same race as xAI/nous — another Hermes process
@@ -1185,9 +1225,9 @@ class CredentialPool:
                             last_error_reset_at=None,
                         )
                         self._replace_entry(entry, updated)
-                        if self._current_id == entry.id:
-                            self._current_id = None
-                        self._persist(update_status_entry_ids={updated.id})
+                        if self._current_identity == _credential_identity(entry):
+                            self._current_identity = None
+                        self._persist(update_status_entry_identities={_credential_identity(updated)})
                         return None
                     try:
                         with auth_mod._codex_auth_store_lock():
@@ -1227,32 +1267,25 @@ class CredentialPool:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc
                         )
-                    dead_alias_ids = set()
+                    removed_alias_hashes = auth_mod._remove_codex_linked_legacy_aliases(
+                        entry.refresh_token,
+                    )
                     remaining_entries = []
                     for item in self._entries:
                         if item.source == "device_code":
                             continue
                         if (
                             item.source == "manual:device_code"
-                            and item.refresh_token == entry.refresh_token
+                            and auth_mod._codex_refresh_token_hash(item.refresh_token)
+                            in removed_alias_hashes
                         ):
-                            item = replace(
-                                item,
-                                last_status=STATUS_DEAD,
-                                last_status_at=time.time(),
-                                last_error_code=401,
-                                last_error_reason=getattr(exc, "code", "unknown"),
-                                last_error_message=str(exc),
-                                last_error_reset_at=None,
-                            )
-                            dead_alias_ids.add(item.id)
+                            continue
                         remaining_entries.append(item)
                     self._entries = remaining_entries
-                    if self._current_id == entry.id:
-                        self._current_id = None
+                    if self._current_identity == _credential_identity(entry):
+                        self._current_identity = None
                     self._persist(
                         replace_shared_entries=True,
-                        update_status_entry_ids=dead_alias_ids,
                     )
                     return None
             # For nous: another process may have consumed the refresh token
@@ -1314,8 +1347,8 @@ class CredentialPool:
                         item for item in self._entries
                         if item.source not in singleton_sources
                     ]
-                    if self._current_id == entry.id:
-                        self._current_id = None
+                    if self._current_identity == _credential_identity(entry):
+                        self._current_identity = None
                     self._persist()
                     return None
             self._mark_exhausted(entry, None)
@@ -1344,8 +1377,8 @@ class CredentialPool:
                 tokens["refresh_token"] = updated.refresh_token
             auth_mod._save_codex_tokens(tokens, updated.last_refresh)
         self._persist(
-            replace_entry_ids=(
-                {updated.id}
+            replace_entry_identities=(
+                {_credential_identity(updated)}
                 if self.provider == "openai-codex" and updated.source != "device_code"
                 else None
             ),
@@ -1394,8 +1427,8 @@ class CredentialPool:
         """
         now = time.time()
         cleared_any = False
-        entries_to_prune: List[str] = []
-        status_entry_ids: Set[str] = set()
+        entries_to_prune: List[Tuple[str, str]] = []
+        status_entry_identities: Set[Tuple[str, str]] = set()
         available: List[PooledCredential] = []
         for entry in self._entries:
             # For anthropic claude_code entries, sync from the credentials file
@@ -1461,7 +1494,7 @@ class CredentialPool:
                         )
                         # Mark for removal after the loop completes; we can't
                         # mutate self._entries while iterating.
-                        entries_to_prune.append(entry.id)
+                        entries_to_prune.append(_credential_identity(entry))
                         cleared_any = True
                 # Permanently failed credentials never re-enter rotation via
                 # TTL.  They only clear when a write-side re-auth sync rewrites
@@ -1486,7 +1519,7 @@ class CredentialPool:
                     self._replace_entry(entry, cleared)
                     entry = cleared
                     cleared_any = True
-                    status_entry_ids.add(entry.id)
+                    status_entry_identities.add(_credential_identity(entry))
             if refresh and self._entry_needs_refresh(entry):
                 refreshed = self._refresh_entry(entry, force=False)
                 if refreshed is None:
@@ -1494,25 +1527,28 @@ class CredentialPool:
                 entry = refreshed
             available.append(entry)
         if entries_to_prune:
-            pruned_ids = set(entries_to_prune)
-            self._entries = [e for e in self._entries if e.id not in pruned_ids]
+            pruned_identities = set(entries_to_prune)
+            self._entries = [
+                entry for entry in self._entries
+                if _credential_identity(entry) not in pruned_identities
+            ]
         if cleared_any:
             self._persist(
-                remove_entry_ids=set(entries_to_prune),
-                update_status_entry_ids=status_entry_ids,
+                remove_entry_identities=set(entries_to_prune),
+                update_status_entry_identities=status_entry_identities,
             )
         return available
 
     def _select_unlocked(self) -> Optional[PooledCredential]:
         available = self._available_entries(clear_expired=True, refresh=True)
         if not available:
-            self._current_id = None
+            self._current_identity = None
             logger.info("credential pool: no available entries (all exhausted or empty)")
             return None
 
         if self._strategy == STRATEGY_RANDOM:
             entry = random.choice(available)
-            self._current_id = entry.id
+            self._current_identity = _credential_identity(entry)
             return entry
 
         if self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
@@ -1520,20 +1556,24 @@ class CredentialPool:
             # Increment usage counter so subsequent selections distribute load
             updated = replace(entry, request_count=entry.request_count + 1)
             self._replace_entry(entry, updated)
-            self._current_id = entry.id
+            self._current_identity = _credential_identity(updated)
             return updated
 
         if self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
             entry = available[0]
-            rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
+            rotated = [candidate for candidate in self._entries if candidate is not entry]
             rotated.append(replace(entry, priority=len(self._entries) - 1))
             self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
-            self._persist(update_order_entry_ids={candidate.id for candidate in self._entries})
-            self._current_id = entry.id
+            self._persist(
+                update_order_entry_identities={
+                    _credential_identity(candidate) for candidate in self._entries
+                },
+            )
+            self._current_identity = _credential_identity(entry)
             return self.current() or entry
 
         entry = available[0]
-        self._current_id = entry.id
+        self._current_identity = _credential_identity(entry)
         return entry
 
     def peek(self) -> Optional[PooledCredential]:
@@ -1569,7 +1609,11 @@ class CredentialPool:
             self._mark_exhausted(entry, status_code, error_context)
             # Re-read the updated entry to log the correct terminal state.
             updated_entry = next(
-                (e for e in self._entries if e.id == entry.id), entry,
+                (
+                    e for e in self._entries
+                    if _credential_identity(e) == _credential_identity(entry)
+                ),
+                entry,
             )
             if updated_entry.last_status == STATUS_DEAD:
                 logger.warning(
@@ -1582,7 +1626,7 @@ class CredentialPool:
                     "credential pool: marking %s exhausted (status=%s), rotating",
                     _label, status_code,
                 )
-            self._current_id = None
+            self._current_identity = None
             next_entry = self._select_unlocked()
             if next_entry:
                 _next_label = next_entry.label or next_entry.id[:8]
@@ -1600,7 +1644,13 @@ class CredentialPool:
         with self._lock:
             if credential_id:
                 self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
-                self._current_id = credential_id
+                entry = next(
+                    (entry for entry in self._entries if entry.id == credential_id),
+                    None,
+                )
+                self._current_identity = (
+                    _credential_identity(entry) if entry is not None else None
+                )
                 return credential_id
 
             available = self._available_entries(clear_expired=True, refresh=True)
@@ -1617,7 +1667,7 @@ class CredentialPool:
                 key=lambda entry: (self._active_leases.get(entry.id, 0), entry.priority),
             )
             self._active_leases[chosen.id] = self._active_leases.get(chosen.id, 0) + 1
-            self._current_id = chosen.id
+            self._current_identity = _credential_identity(chosen)
             return chosen.id
 
     def release_lease(self, credential_id: str) -> None:
@@ -1639,13 +1689,13 @@ class CredentialPool:
             return None
         refreshed = self._refresh_entry(entry, force=True)
         if refreshed is not None:
-            self._current_id = refreshed.id
+            self._current_identity = _credential_identity(refreshed)
         return refreshed
 
     def reset_statuses(self) -> int:
         count = 0
         new_entries = []
-        reset_entry_ids = set()
+        reset_entry_identities = set()
         for entry in self._entries:
             if entry.last_status or entry.last_status_at or entry.last_error_code:
                 new_entries.append(
@@ -1660,12 +1710,12 @@ class CredentialPool:
                     )
                 )
                 count += 1
-                reset_entry_ids.add(entry.id)
+                reset_entry_identities.add(_credential_identity(entry))
             else:
                 new_entries.append(entry)
         if count:
             self._entries = new_entries
-            self._persist(update_status_entry_ids=reset_entry_ids)
+            self._persist(update_status_entry_identities=reset_entry_identities)
         return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
@@ -1676,36 +1726,48 @@ class CredentialPool:
             self.provider == "openai-codex"
             and removed.source == "device_code"
         )
-        removed_entry_ids = {removed.id}
-        if remove_codex_family and removed.refresh_token:
-            retained_entries = []
-            for entry in self._entries:
-                if (
-                    entry.source == "manual:device_code"
-                    and entry.refresh_token == removed.refresh_token
-                ):
-                    removed_entry_ids.add(entry.id)
-                    continue
-                retained_entries.append(entry)
-            self._entries = retained_entries
-        self._entries = [
-            replace(entry, priority=new_priority)
-            for new_priority, entry in enumerate(self._entries)
-        ]
-        persist_kwargs = {
-            "replace_shared_entries": remove_codex_family,
-            "remove_entry_ids": removed_entry_ids,
-            "update_order_entry_ids": {entry.id for entry in self._entries},
-            "clear_shared_provider_state": remove_codex_family,
-        }
+        removed_entry_identities = {_credential_identity(removed)}
         if remove_codex_family:
             with auth_mod._codex_auth_store_lock():
-                auth_mod._remove_codex_linked_legacy_aliases(removed.refresh_token)
-                self._persist(**persist_kwargs)
+                removed_alias_hashes = auth_mod._remove_codex_linked_legacy_aliases(
+                    removed.refresh_token,
+                )
+                retained_entries = []
+                for entry in self._entries:
+                    if (
+                        entry.source == "manual:device_code"
+                        and auth_mod._codex_refresh_token_hash(entry.refresh_token)
+                        in removed_alias_hashes
+                    ):
+                        removed_entry_identities.add(_credential_identity(entry))
+                        continue
+                    retained_entries.append(entry)
+                self._entries = retained_entries
+                self._entries = [
+                    replace(entry, priority=new_priority)
+                    for new_priority, entry in enumerate(self._entries)
+                ]
+                self._persist(
+                    replace_shared_entries=True,
+                    remove_entry_identities=removed_entry_identities,
+                    update_order_entry_identities={
+                        _credential_identity(entry) for entry in self._entries
+                    },
+                    clear_shared_provider_state=True,
+                )
         else:
-            self._persist(**persist_kwargs)
-        if self._current_id in removed_entry_ids:
-            self._current_id = None
+            self._entries = [
+                replace(entry, priority=new_priority)
+                for new_priority, entry in enumerate(self._entries)
+            ]
+            self._persist(
+                remove_entry_identities=removed_entry_identities,
+                update_order_entry_identities={
+                    _credential_identity(entry) for entry in self._entries
+                },
+            )
+        if self._current_identity in removed_entry_identities:
+            self._current_identity = None
         return removed
 
     def resolve_target(self, target: Any) -> Tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
@@ -1736,7 +1798,7 @@ class CredentialPool:
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
         entry = replace(entry, priority=_next_priority(self._entries))
         self._entries.append(entry)
-        self._persist(add_entry_ids={entry.id})
+        self._persist(add_entry_identities={_credential_identity(entry)})
         return entry
 
 
@@ -2349,10 +2411,10 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
-    raw_entries_by_id = {
-        payload["id"]: payload
+    raw_entries_by_identity = {
+        _payload_identity(payload): payload
         for payload in raw_entries
-        if isinstance(payload, dict) and isinstance(payload.get("id"), str)
+        if isinstance(payload, dict) and _payload_identity(payload) is not None
     }
     raw_needs_sanitization = any(
         isinstance(payload, dict)
@@ -2378,28 +2440,28 @@ def load_pool(provider: str) -> CredentialPool:
             entry.to_dict()
             for entry in sorted(entries, key=lambda item: item.priority)
         ]
-        serialized_entries_by_id = {
-            payload["id"]: payload
+        serialized_entries_by_identity = {
+            _payload_identity(payload): payload
             for payload in serialized_entries
-            if isinstance(payload.get("id"), str)
+            if _payload_identity(payload) is not None
         }
-        entry_ids = set(serialized_entries_by_id)
-        raw_entry_ids = set(raw_entries_by_id)
+        entry_identities = set(serialized_entries_by_identity)
+        raw_entry_identities = set(raw_entries_by_identity)
         write_credential_pool(
             provider,
             serialized_entries,
             preserve_shared_entries=True,
             preserve_profile_entries=True,
-            add_entry_ids=frozenset(entry_ids - raw_entry_ids),
-            replace_entry_ids=frozenset(
-                entry_id
-                for entry_id in entry_ids & raw_entry_ids
+            add_entry_identities=frozenset(entry_identities - raw_entry_identities),
+            replace_entry_identities=frozenset(
+                identity
+                for identity in entry_identities & raw_entry_identities
                 if is_borrowed_credential_source(
-                    serialized_entries_by_id[entry_id].get("source"),
+                    serialized_entries_by_identity[identity].get("source"),
                     provider,
                 )
-                and serialized_entries_by_id[entry_id] != raw_entries_by_id[entry_id]
+                and serialized_entries_by_identity[identity] != raw_entries_by_identity[identity]
             ),
-            remove_entry_ids=frozenset(raw_entry_ids - entry_ids),
+            remove_entry_identities=frozenset(raw_entry_identities - entry_identities),
         )
     return CredentialPool(provider, entries)
