@@ -1672,21 +1672,39 @@ class CredentialPool:
         if index < 1 or index > len(self._entries):
             return None
         removed = self._entries.pop(index - 1)
+        remove_codex_family = (
+            self.provider == "openai-codex"
+            and removed.source == "device_code"
+        )
+        removed_entry_ids = {removed.id}
+        if remove_codex_family and removed.refresh_token:
+            retained_entries = []
+            for entry in self._entries:
+                if (
+                    entry.source == "manual:device_code"
+                    and entry.refresh_token == removed.refresh_token
+                ):
+                    removed_entry_ids.add(entry.id)
+                    continue
+                retained_entries.append(entry)
+            self._entries = retained_entries
         self._entries = [
             replace(entry, priority=new_priority)
             for new_priority, entry in enumerate(self._entries)
         ]
-        self._persist(
-            replace_shared_entries=(
-                self.provider == "openai-codex" and removed.source == "device_code"
-            ),
-            remove_entry_ids={removed.id},
-            update_order_entry_ids={entry.id for entry in self._entries},
-            clear_shared_provider_state=(
-                self.provider == "openai-codex" and removed.source == "device_code"
-            ),
-        )
-        if self._current_id == removed.id:
+        persist_kwargs = {
+            "replace_shared_entries": remove_codex_family,
+            "remove_entry_ids": removed_entry_ids,
+            "update_order_entry_ids": {entry.id for entry in self._entries},
+            "clear_shared_provider_state": remove_codex_family,
+        }
+        if remove_codex_family:
+            with auth_mod._codex_auth_store_lock():
+                auth_mod._remove_codex_linked_legacy_aliases(removed.refresh_token)
+                self._persist(**persist_kwargs)
+        else:
+            self._persist(**persist_kwargs)
+        if self._current_id in removed_entry_ids:
             self._current_id = None
         return removed
 
@@ -2331,6 +2349,11 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
+    raw_entries_by_id = {
+        payload["id"]: payload
+        for payload in raw_entries
+        if isinstance(payload, dict) and isinstance(payload.get("id"), str)
+    }
     raw_needs_sanitization = any(
         isinstance(payload, dict)
         and sanitize_borrowed_credential_payload(payload, provider) != payload
@@ -2351,10 +2374,32 @@ def load_pool(provider: str) -> CredentialPool:
         changed |= _normalize_pool_priorities(provider, entries)
 
     if changed:
+        serialized_entries = [
+            entry.to_dict()
+            for entry in sorted(entries, key=lambda item: item.priority)
+        ]
+        serialized_entries_by_id = {
+            payload["id"]: payload
+            for payload in serialized_entries
+            if isinstance(payload.get("id"), str)
+        }
+        entry_ids = set(serialized_entries_by_id)
+        raw_entry_ids = set(raw_entries_by_id)
         write_credential_pool(
             provider,
-            [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
+            serialized_entries,
             preserve_shared_entries=True,
             preserve_profile_entries=True,
+            add_entry_ids=frozenset(entry_ids - raw_entry_ids),
+            replace_entry_ids=frozenset(
+                entry_id
+                for entry_id in entry_ids & raw_entry_ids
+                if is_borrowed_credential_source(
+                    serialized_entries_by_id[entry_id].get("source"),
+                    provider,
+                )
+                and serialized_entries_by_id[entry_id] != raw_entries_by_id[entry_id]
+            ),
+            remove_entry_ids=frozenset(raw_entry_ids - entry_ids),
         )
     return CredentialPool(provider, entries)
