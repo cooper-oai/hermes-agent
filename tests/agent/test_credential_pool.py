@@ -3181,6 +3181,68 @@ def test_codex_manual_pool_refresh_serializes_within_named_profile(tmp_path, mon
     assert profile_entry["refresh_token"] == "refresh-1"
 
 
+def test_codex_linked_manual_alias_refresh_updates_canonical_family(tmp_path, monkeypatch):
+    """A migrated alias spends and saves through the shared canonical family."""
+    root_home = tmp_path / "hermes"
+    profile_home = root_home / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    from hermes_cli.auth import CODEX_REFRESH_OWNER
+
+    auth_store = _codex_auth_store("shared-old-at", "shared-old-rt")
+    auth_store["providers"]["openai-codex"]["refresh_owner"] = CODEX_REFRESH_OWNER
+    auth_store["credential_pool"] = {
+        "openai-codex": [{
+            "id": "shared-codex",
+            "source": "device_code",
+            "auth_type": "oauth",
+            "access_token": "shared-old-at",
+            "refresh_token": "shared-old-rt",
+        }],
+    }
+    (root_home / "auth.json").write_text(json.dumps(auth_store, indent=2))
+    (profile_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "credential_pool": {
+            "openai-codex": [{
+                "id": "linked-alias",
+                "source": "manual:device_code",
+                "auth_type": "oauth",
+                "access_token": "stale-linked-at",
+                "refresh_token": "shared-old-rt",
+            }],
+        },
+    }, indent=2))
+
+    import hermes_cli.auth as auth_mod
+    from agent.credential_pool import load_pool
+
+    monkeypatch.setattr(
+        auth_mod,
+        "refresh_codex_oauth_pure",
+        lambda *_args, **_kwargs: {
+            "access_token": "shared-new-at",
+            "refresh_token": "shared-new-rt",
+            "last_refresh": "2026-05-29T00:00:00Z",
+        },
+    )
+    pool = load_pool("openai-codex")
+    alias = next(entry for entry in pool.entries() if entry.id == "linked-alias")
+
+    refreshed = pool._refresh_entry(alias, force=True)
+
+    assert refreshed is not None
+    assert refreshed.refresh_token == "shared-new-rt"
+    root_payload = json.loads((root_home / "auth.json").read_text())
+    state = root_payload["providers"]["openai-codex"]
+    assert state["tokens"]["refresh_token"] == "shared-new-rt"
+    shared = root_payload["credential_pool"]["openai-codex"][0]
+    assert shared["refresh_token"] == "shared-new-rt"
+    profile_payload = json.loads((profile_home / "auth.json").read_text())
+    alias_payload = profile_payload["credential_pool"]["openai-codex"][0]
+    assert alias_payload["refresh_token"] == "shared-new-rt"
+
+
 def test_codex_pool_refresh_serializes_with_singleton_refresh(tmp_path, monkeypatch):
     """Pool refresh must adopt a token rotated by the singleton path."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -3565,6 +3627,64 @@ def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
     assert refresh_calls["count"] == 1
 
 
+def test_codex_oauth_terminal_refresh_quarantines_stale_access_linked_alias(
+    tmp_path, monkeypatch
+):
+    """A linked alias stays dead after its canonical refresh token is revoked."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_OAUTH_ACCESS_TOKEN", raising=False)
+    auth_store = _codex_auth_store("shared-access", "shared-refresh")
+    auth_store["credential_pool"] = {
+        "openai-codex": [{
+            "id": "shared-codex",
+            "source": "device_code",
+            "auth_type": "oauth",
+            "priority": 0,
+            "access_token": "shared-access",
+            "refresh_token": "shared-refresh",
+        }, {
+            "id": "linked-alias",
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "priority": 1,
+            "access_token": "stale-linked-access",
+            "refresh_token": "shared-refresh",
+        }],
+    }
+    _write_auth_store(tmp_path, auth_store)
+
+    from agent.credential_pool import STATUS_DEAD, load_pool
+    import hermes_cli.auth as auth_mod
+    from hermes_cli.auth import AuthError
+
+    pool = load_pool("openai-codex")
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "shared-codex"
+
+    def _terminal_refresh_failure(*_args, **_kwargs):
+        raise AuthError(
+            "Refresh session has been revoked",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _terminal_refresh_failure)
+
+    assert pool.try_refresh_current() is None
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entries = {
+        entry["id"]: entry
+        for entry in auth_payload["credential_pool"]["openai-codex"]
+    }
+    assert "shared-codex" not in entries
+    assert entries["linked-alias"]["last_status"] == STATUS_DEAD
+    assert entries["linked-alias"]["last_error_reason"] == "invalid_grant"
+
+
 def test_codex_manual_terminal_refresh_preserves_shared_family(tmp_path, monkeypatch):
     """A dead independent manual token must not quarantine the shared family."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -3621,6 +3741,60 @@ def test_codex_manual_terminal_refresh_preserves_shared_family(tmp_path, monkeyp
     }
     assert entries["manual-codex"]["last_status"] == STATUS_DEAD
     assert entries["manual-codex"]["last_error_reason"] == "invalid_grant"
+    assert entries["shared-codex"]["refresh_token"] == "shared-refresh"
+
+
+def test_codex_superseded_manual_alias_fails_before_refresh_post(tmp_path, monkeypatch):
+    """A stale linked alias must never submit its consumed refresh token."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_OAUTH_ACCESS_TOKEN", raising=False)
+    import hermes_cli.auth as auth_mod
+
+    auth_store = _codex_auth_store("shared-access", "shared-refresh")
+    state = auth_store["providers"]["openai-codex"]
+    state[auth_mod.CODEX_SUPERSEDED_REFRESH_TOKEN_HASHES_KEY] = [
+        auth_mod._codex_refresh_token_hash("manual-consumed-refresh"),
+    ]
+    auth_store["credential_pool"] = {
+        "openai-codex": [{
+            "id": "manual-codex",
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "priority": 0,
+            "access_token": "manual-stale-access",
+            "refresh_token": "manual-consumed-refresh",
+        }, {
+            "id": "shared-codex",
+            "source": "device_code",
+            "auth_type": "oauth",
+            "priority": 1,
+            "access_token": "shared-access",
+            "refresh_token": "shared-refresh",
+        }],
+    }
+    _write_auth_store(tmp_path, auth_store)
+
+    from agent.credential_pool import STATUS_DEAD, load_pool
+
+    pool = load_pool("openai-codex")
+    manual = next(entry for entry in pool.entries() if entry.id == "manual-codex")
+    pool._current_id = manual.id
+    monkeypatch.setattr(
+        auth_mod,
+        "refresh_codex_oauth_pure",
+        lambda *_args, **_kwargs: pytest.fail("superseded alias must fail before POST"),
+    )
+
+    assert pool.try_refresh_current() is None
+
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entries = {
+        entry["id"]: entry
+        for entry in payload["credential_pool"]["openai-codex"]
+    }
+    assert entries["manual-codex"]["last_status"] == STATUS_DEAD
+    assert entries["manual-codex"]["last_error_reason"] == "refresh_token_reused"
     assert entries["shared-codex"]["refresh_token"] == "shared-refresh"
 
 
